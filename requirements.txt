@@ -1,6 +1,2 @@
-
 viam-sdk==0.53.0
-
 typing-extensions
-
-asyncio-subprocess
