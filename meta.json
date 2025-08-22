@@ -2,13 +2,13 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "mcvella:rtsp-loopback-mic",
   "visibility": "public",
-  "url": "",
+  "url": "https://github.com/mcvella/viam-rtsp-loopback-mic",
   "description": "Modular sensor component: rtsp-loopback-mic",
   "models": [
     {
       "api": "rdk:component:sensor",
       "model": "mcvella:rtsp-loopback-mic:rtsp-loopback-mic",
-      "short_description": "Provide a short (100 characters or less) description of this model here",
+      "short_description": "Play audio from an RTSP stream on a Linux loopback device",
       "markdown_link": "README.md#model-mcvellartsp-loopback-micrtsp-loopback-mic"
     }
   ],
