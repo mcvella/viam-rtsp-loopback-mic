@@ -1,0 +1,294 @@
+import asyncio
+import subprocess
+import re
+from typing import (Any, ClassVar, Dict, Final, List, Mapping, Optional,
+                    Sequence, Tuple)
+
+from typing_extensions import Self
+from viam.components.sensor import *
+from viam.proto.app.robot import ComponentConfig
+from viam.proto.common import Geometry, ResourceName
+from viam.resource.base import ResourceBase
+from viam.resource.easy_resource import EasyResource
+from viam.resource.types import Model, ModelFamily
+from viam.utils import SensorReading, ValueTypes, struct_to_dict
+
+
+class RtspLoopbackMic(Sensor, EasyResource):
+    # To enable debug-level logging, either run viam-server with the --debug option,
+    # or configure your resource/machine to display debug logs.
+    MODEL: ClassVar[Model] = Model(
+        ModelFamily("mcvella", "rtsp-loopback-mic"), "rtsp-loopback-mic"
+    )
+
+
+    rtsp_url: Optional[str] = None
+    ffmpeg_process: Optional[asyncio.subprocess.Process] = None
+    loopback_device: Optional[str] = None
+    ffmpeg_output: str = ""
+    is_streaming: bool = False
+
+    @classmethod
+    def new(
+        cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
+    ) -> Self:
+        """This method creates a new instance of this Sensor component.
+        The default implementation sets the name from the `config` parameter and then calls `reconfigure`.
+
+        Args:
+            config (ComponentConfig): The configuration for this resource
+            dependencies (Mapping[ResourceName, ResourceBase]): The dependencies (both required and optional)
+
+        Returns:
+            Self: The resource
+        """
+        return super().new(config, dependencies)
+
+    @classmethod
+    def validate_config(
+        cls, config: ComponentConfig
+    ) -> Tuple[Sequence[str], Sequence[str]]:
+        """This method allows you to validate the configuration object received from the machine,
+        as well as to return any required dependencies or optional dependencies based on that `config`.
+
+        Args:
+            config (ComponentConfig): The configuration for this resource
+
+        Returns:
+            Tuple[Sequence[str], Sequence[str]]: A tuple where the
+                first element is a list of required dependencies and the
+                second element is a list of optional dependencies
+        """
+        # Validate that rtsp_url is provided in attributes
+        attributes = struct_to_dict(config.attributes)
+        if not attributes or "rtsp_url" not in attributes:
+            raise ValueError("rtsp_url is required in attributes")
+        
+        rtsp_url = attributes.get("rtsp_url")
+        if not rtsp_url or not isinstance(rtsp_url, str):
+            raise ValueError("rtsp_url must be a non-empty string")
+        
+        return [], []
+
+    def reconfigure(
+        self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
+    ):
+        """This method allows you to dynamically update your service when it receives a new `config` object.
+
+        Args:
+            config (ComponentConfig): The new configuration
+            dependencies (Mapping[ResourceName, ResourceBase]): Any dependencies (both required and optional)
+        """
+        # Stop existing stream if running
+        if self.is_streaming:
+            asyncio.create_task(self.stop_stream())
+        
+        # Update RTSP URL
+        attributes = struct_to_dict(config.attributes)
+        if attributes and "rtsp_url" in attributes:
+            self.rtsp_url = attributes.get("rtsp_url")
+            self.logger.info(f"RTSP URL updated to: {self.rtsp_url}")
+        
+        # Start new stream
+        if self.rtsp_url:
+            asyncio.create_task(self.start_stream())
+
+    async def setup_loopback_device(self) -> str:
+        """Set up the loopback audio device and return the device number."""
+        try:
+            # Load the snd-aloop module
+            self.logger.info("Loading snd-aloop module...")
+            result = await asyncio.create_subprocess_exec(
+                "modprobe", "snd-aloop",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            await result.communicate()
+            
+            # Get available audio devices
+            self.logger.info("Getting audio device list...")
+            result = await asyncio.create_subprocess_exec(
+                "arecord", "-l",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await result.communicate()
+            
+            if result.returncode != 0:
+                raise RuntimeError(f"Failed to get audio devices: {stderr.decode()}")
+            
+            # Parse the output to find loopback device
+            output = stdout.decode()
+            self.logger.info(f"Audio devices found:\n{output}")
+            
+            # Look for loopback device (usually shows as "Loopback" in the name)
+            lines = output.split('\n')
+            for line in lines:
+                if 'Loopback' in line or 'loopback' in line:
+                    # Extract device number from line like "card 4: Loopback [Loopback], device 0: Loopback PCM [Loopback PCM]"
+                    match = re.search(r'card (\d+):', line)
+                    if match:
+                        device_num = match.group(1)
+                        self.logger.info(f"Found loopback device: {device_num}")
+                        return device_num
+            
+            # If no loopback device found, try to use the last available device
+            matches = re.findall(r'card (\d+):', output)
+            if matches:
+                device_num = matches[-1]
+                self.logger.info(f"Using last available device: {device_num}")
+                return device_num
+            
+            raise RuntimeError("No suitable audio device found")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to setup loopback device: {e}")
+            raise
+
+    async def start_stream(self):
+        """Start the ffmpeg stream to the loopback device."""
+        if not self.rtsp_url:
+            self.logger.error("No RTSP URL configured")
+            return
+        
+        try:
+            # Stop existing stream if running
+            if self.is_streaming:
+                await self.stop_stream()
+            
+            # Setup loopback device
+            self.loopback_device = await self.setup_loopback_device()
+            
+            # Build ffmpeg command
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-i", self.rtsp_url,
+                "-f", "alsa",
+                f"hw:{self.loopback_device},0,0",
+                "-y"  # Overwrite output file if it exists
+            ]
+            
+            self.logger.info(f"Starting ffmpeg stream: {' '.join(ffmpeg_cmd)}")
+            
+            # Start ffmpeg process
+            self.ffmpeg_process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            self.is_streaming = True
+            self.ffmpeg_output = ""
+            
+            # Start monitoring the output
+            asyncio.create_task(self.monitor_ffmpeg_output())
+            
+            self.logger.info("FFmpeg stream started successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to start stream: {e}")
+            self.is_streaming = False
+
+    async def stop_stream(self):
+        """Stop the ffmpeg stream."""
+        if self.ffmpeg_process:
+            try:
+                self.ffmpeg_process.terminate()
+                await asyncio.wait_for(self.ffmpeg_process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self.logger.warning("FFmpeg process didn't terminate gracefully, killing it")
+                self.ffmpeg_process.kill()
+                await self.ffmpeg_process.wait()
+            except Exception as e:
+                self.logger.error(f"Error stopping ffmpeg process: {e}")
+            finally:
+                self.ffmpeg_process = None
+                self.is_streaming = False
+                self.logger.info("FFmpeg stream stopped")
+
+    async def monitor_ffmpeg_output(self):
+        """Monitor ffmpeg output and store it for get_readings."""
+        if not self.ffmpeg_process:
+            return
+        
+        try:
+            while self.is_streaming and self.ffmpeg_process:
+                # Read stderr (ffmpeg outputs progress to stderr)
+                line = await self.ffmpeg_process.stderr.readline()
+                if not line:
+                    break
+                
+                line_str = line.decode().strip()
+                if line_str:
+                    self.ffmpeg_output = line_str
+                    self.logger.debug(f"FFmpeg output: {line_str}")
+        
+        except Exception as e:
+            self.logger.error(f"Error monitoring ffmpeg output: {e}")
+        finally:
+            if self.ffmpeg_process:
+                await self.ffmpeg_process.wait()
+                self.is_streaming = False
+
+    async def get_readings(
+        self,
+        *,
+        extra: Optional[Mapping[str, Any]] = None,
+        timeout: Optional[float] = None,
+        **kwargs
+    ) -> Mapping[str, SensorReading]:
+        """Get current readings from the RTSP loopback microphone.
+        
+        Returns:
+            Mapping containing:
+            - streaming_status: Whether the stream is active
+            - rtsp_url: The current RTSP URL
+            - loopback_device: The audio device being used
+            - ffmpeg_output: The latest ffmpeg output line
+            - ffmpeg_process_id: The process ID if running
+        """
+        readings = {
+            "streaming_status": self.is_streaming,
+            "rtsp_url": self.rtsp_url or "Not configured",
+            "loopback_device": self.loopback_device or "Not configured",
+            "ffmpeg_output": self.ffmpeg_output or "No output yet",
+            "ffmpeg_process_id": self.ffmpeg_process.pid if self.ffmpeg_process else None
+        }
+        
+        return readings
+
+    async def do_command(
+        self,
+        command: Mapping[str, ValueTypes],
+        *,
+        timeout: Optional[float] = None,
+        **kwargs
+    ) -> Mapping[str, ValueTypes]:
+        """Handle custom commands for controlling the stream.
+        
+        Supported commands:
+        - start_stream: Start the ffmpeg stream
+        - stop_stream: Stop the ffmpeg stream
+        - restart_stream: Restart the ffmpeg stream
+        """
+        cmd = command.get("command")
+        
+        if cmd == "start_stream":
+            await self.start_stream()
+            return {"status": "started"}
+        elif cmd == "stop_stream":
+            await self.stop_stream()
+            return {"status": "stopped"}
+        elif cmd == "restart_stream":
+            await self.stop_stream()
+            await self.start_stream()
+            return {"status": "restarted"}
+        else:
+            return {"error": f"Unknown command: {cmd}"}
+
+    async def get_geometries(
+        self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None
+    ) -> List[Geometry]:
+        self.logger.error("`get_geometries` is not implemented")
+        raise NotImplementedError()
+
