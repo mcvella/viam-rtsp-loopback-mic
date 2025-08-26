@@ -102,6 +102,9 @@ This model implements DoCommand for controlling the audio stream:
 | `restart_stream` | Restart the FFmpeg audio stream |
 | `reset_restart_count` | Reset the restart counter to allow more restart attempts |
 | `cleanup_alsa` | Clean up ALSA devices to resolve "device busy" errors |
+| `sync_process` | Sync process status with actual running FFmpeg processes |
+| `process_status` | Show detailed process status and PID information |
+| `cleanup_old` | Clean up old FFmpeg processes from previous module instances |
 
 #### Example DoCommand
 

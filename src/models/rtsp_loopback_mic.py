@@ -87,6 +87,9 @@ class RtspLoopbackMic(Sensor, EasyResource):
             config (ComponentConfig): The new configuration
             dependencies (Mapping[ResourceName, ResourceBase]): Any dependencies (both required and optional)
         """
+        # Clean up any existing FFmpeg processes from previous module instances
+        asyncio.create_task(self.cleanup_old_processes())
+        
         # Stop existing stream if running
         if self.is_streaming:
             asyncio.create_task(self.stop_stream())
@@ -164,6 +167,9 @@ class RtspLoopbackMic(Sensor, EasyResource):
             if self.is_streaming:
                 await self.stop_stream()
             
+            # Clean up any old processes that might conflict
+            await self.cleanup_old_processes()
+            
             # Setup loopback device
             self.loopback_device = await self.setup_loopback_device()
             
@@ -196,6 +202,7 @@ class RtspLoopbackMic(Sensor, EasyResource):
             
             # Start monitoring the output
             asyncio.create_task(self.monitor_ffmpeg_output())
+            asyncio.create_task(self.periodic_process_check())
             
             self.logger.info("FFmpeg stream started successfully")
             
@@ -246,6 +253,133 @@ class RtspLoopbackMic(Sensor, EasyResource):
         except Exception as e:
             self.logger.warning(f"Error during ALSA cleanup: {e}")
 
+    async def cleanup_old_processes(self):
+        """Clean up FFmpeg processes from previous module instances."""
+        try:
+            self.logger.info("Cleaning up old FFmpeg processes from previous module instances")
+            
+            # Kill any FFmpeg processes that might be from previous module instances
+            cleanup_cmd = [
+                "pkill", "-f", "ffmpeg.*-f alsa.*hw:"
+            ]
+            
+            result = await asyncio.create_subprocess_exec(
+                *cleanup_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await result.wait()
+            
+            # Give processes time to terminate
+            await asyncio.sleep(2)
+            
+            # Also clean up any processes with our specific RTSP URL if configured
+            if self.rtsp_url:
+                url_cleanup_cmd = [
+                    "pkill", "-f", f"ffmpeg.*{self.rtsp_url}"
+                ]
+                
+                result = await asyncio.create_subprocess_exec(
+                    *url_cleanup_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                await result.wait()
+                await asyncio.sleep(1)
+            
+            self.logger.info("Old FFmpeg processes cleanup completed")
+            
+        except Exception as e:
+            self.logger.warning(f"Error during old processes cleanup: {e}")
+
+    async def check_process_status(self):
+        """Check if the FFmpeg process is actually running and sync state."""
+        if self.ffmpeg_process:
+            try:
+                # Check if process is still alive
+                if self.ffmpeg_process.returncode is None:
+                    # Process is still running
+                    if not self.is_streaming:
+                        self.logger.info("FFmpeg process is running, syncing streaming status")
+                        self.is_streaming = True
+                    return True
+                else:
+                    # Process has terminated, but check if there's another one running
+                    running_pid = await self.find_running_ffmpeg()
+                    if running_pid:
+                        self.logger.info(f"Process state sync: Found different FFmpeg process running: {running_pid} (was tracking: {self.ffmpeg_process.pid if self.ffmpeg_process else 'None'})")
+                        self.is_streaming = True
+                        return True
+                    else:
+                        if self.is_streaming:
+                            self.logger.info("FFmpeg process has terminated, updating status")
+                            self.is_streaming = False
+                        return False
+            except Exception as e:
+                self.logger.error(f"Error checking process status: {e}")
+                return False
+        else:
+            # No tracked process, but check if there's one running
+            running_pid = await self.find_running_ffmpeg()
+            if running_pid:
+                self.logger.info(f"Process state sync: Found running FFmpeg process but not tracking it: {running_pid}")
+                self.is_streaming = True
+                return True
+            else:
+                if self.is_streaming:
+                    self.logger.warning("No FFmpeg process but streaming status is True, correcting")
+                    self.is_streaming = False
+                return False
+
+    async def find_running_ffmpeg(self):
+        """Find and attach to a running FFmpeg process for this RTSP stream."""
+        try:
+            # Look for FFmpeg processes with our RTSP URL
+            cmd = ["pgrep", "-f", f"ffmpeg.*{self.rtsp_url}"]
+            result = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            stdout, _ = await result.communicate()
+            
+            if result.returncode == 0 and stdout.strip():
+                pid = stdout.strip().decode()
+                self.logger.info(f"Found running FFmpeg process: {pid}")
+                return int(pid)
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error finding running FFmpeg: {e}")
+            return None
+
+    async def periodic_process_check(self):
+        """Periodically check process status to catch state mismatches."""
+        while self.is_streaming:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                # Check if our tracked process is still valid
+                if self.ffmpeg_process and self.ffmpeg_process.returncode is not None:
+                    # Our tracked process has died, look for a new one
+                    self.logger.info("Tracked FFmpeg process has terminated, looking for replacement")
+                    running_pid = await self.find_running_ffmpeg()
+                    if running_pid:
+                        self.logger.info(f"Found replacement FFmpeg process: {running_pid}")
+                        # Note: We can't easily reattach to an existing process, 
+                        # but we can at least update our status
+                        self.is_streaming = True
+                    else:
+                        self.logger.warning("No replacement FFmpeg process found")
+                        self.is_streaming = False
+                        break
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in periodic process check: {e}")
+
     async def monitor_ffmpeg_output(self):
         """Monitor ffmpeg output and store it for get_readings."""
         if not self.ffmpeg_process:
@@ -274,9 +408,20 @@ class RtspLoopbackMic(Sensor, EasyResource):
         except Exception as e:
             self.logger.error(f"Error monitoring ffmpeg output: {e}")
         finally:
+            # Check if process is actually still running before marking as stopped
             if self.ffmpeg_process:
-                await self.ffmpeg_process.wait()
-                self.is_streaming = False
+                try:
+                    # Check if process is still alive
+                    if self.ffmpeg_process.returncode is None:
+                        self.logger.warning("FFmpeg monitoring stopped but process appears to still be running")
+                        # Don't set is_streaming = False if process is still alive
+                    else:
+                        await self.ffmpeg_process.wait()
+                        self.is_streaming = False
+                        self.logger.info("FFmpeg process terminated")
+                except Exception as e:
+                    self.logger.error(f"Error checking process status: {e}")
+                    self.is_streaming = False
 
     async def handle_stream_failure(self, failure_type: str):
         """Handle stream failures and attempt recovery."""
@@ -327,6 +472,9 @@ class RtspLoopbackMic(Sensor, EasyResource):
             - ffmpeg_output: The latest ffmpeg output line
             - ffmpeg_process_id: The process ID if running
         """
+        # Check and sync process status
+        await self.check_process_status()
+        
         current_time = time.time()
         time_since_activity = current_time - self.last_activity_time if self.last_activity_time > 0 else 0
         
@@ -376,6 +524,21 @@ class RtspLoopbackMic(Sensor, EasyResource):
         elif cmd == "cleanup_alsa":
             await self.cleanup_alsa_devices()
             return {"status": "alsa_cleanup_completed"}
+        elif cmd == "sync_process":
+            await self.check_process_status()
+            return {"status": "process_synced", "streaming_status": self.is_streaming}
+        elif cmd == "process_status":
+            running_pid = await self.find_running_ffmpeg()
+            return {
+                "status": "process_status",
+                "tracked_pid": self.ffmpeg_process.pid if self.ffmpeg_process else None,
+                "running_pid": running_pid,
+                "streaming_status": self.is_streaming,
+                "process_alive": self.ffmpeg_process.returncode is None if self.ffmpeg_process else False
+            }
+        elif cmd == "cleanup_old":
+            await self.cleanup_old_processes()
+            return {"status": "old_processes_cleanup_completed"}
         else:
             return {"error": f"Unknown command: {cmd}"}
 
