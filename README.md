@@ -58,6 +58,7 @@ The module will automatically attempt to restart the stream when it detects:
 - Network timeouts
 - Broken pipe errors
 - End of file errors
+- Device busy errors
 
 ### Sensor Readings
 
@@ -100,6 +101,7 @@ This model implements DoCommand for controlling the audio stream:
 | `stop_stream`  | Stop the FFmpeg audio stream   |
 | `restart_stream` | Restart the FFmpeg audio stream |
 | `reset_restart_count` | Reset the restart counter to allow more restart attempts |
+| `cleanup_alsa` | Clean up ALSA devices to resolve "device busy" errors |
 
 #### Example DoCommand
 

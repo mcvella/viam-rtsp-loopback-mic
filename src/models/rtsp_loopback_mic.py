@@ -219,6 +219,32 @@ class RtspLoopbackMic(Sensor, EasyResource):
                 self.ffmpeg_process = None
                 self.is_streaming = False
                 self.logger.info("FFmpeg stream stopped")
+        
+        # Clean up any processes that might be holding the ALSA device
+        await self.cleanup_alsa_devices()
+
+    async def cleanup_alsa_devices(self):
+        """Clean up processes that might be holding ALSA devices open."""
+        try:
+            # Kill any FFmpeg processes that might be holding the loopback device
+            cleanup_cmd = [
+                "pkill", "-f", f"ffmpeg.*hw:{self.loopback_device},0,0"
+            ]
+            
+            result = await asyncio.create_subprocess_exec(
+                *cleanup_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await result.wait()
+            
+            # Give ALSA a moment to release the device
+            await asyncio.sleep(1)
+            
+            self.logger.info("ALSA device cleanup completed")
+            
+        except Exception as e:
+            self.logger.warning(f"Error during ALSA cleanup: {e}")
 
     async def monitor_ffmpeg_output(self):
         """Monitor ffmpeg output and store it for get_readings."""
@@ -241,7 +267,7 @@ class RtspLoopbackMic(Sensor, EasyResource):
                     # Check for error conditions that require restart
                     if any(error_indicator in line_str.lower() for error_indicator in 
                            ['connection refused', 'timeout', 'no route to host', 
-                            'connection reset', 'broken pipe', 'end of file']):
+                            'connection reset', 'broken pipe', 'end of file', 'device or resource busy', 'device busy']):
                         self.logger.warning(f"FFmpeg error detected: {line_str}")
                         await self.handle_stream_failure("connection_error")
         
@@ -271,6 +297,13 @@ class RtspLoopbackMic(Sensor, EasyResource):
         if self.restart_count < self.max_restarts:
             self.logger.info(f"Attempting stream restart ({self.restart_count + 1}/{self.max_restarts})")
             await self.stop_stream()
+            
+            # Extra cleanup for device busy errors
+            if "device busy" in failure_type.lower() or "resource busy" in failure_type.lower():
+                self.logger.info("Device busy detected, performing extra cleanup")
+                await self.cleanup_alsa_devices()
+                await asyncio.sleep(3)  # Longer delay for device busy issues
+            
             await asyncio.sleep(2)  # Brief delay before restart
             await self.start_stream()
         else:
@@ -340,6 +373,9 @@ class RtspLoopbackMic(Sensor, EasyResource):
             self.restart_count = 0
             self.last_restart_time = 0
             return {"status": "restart_count_reset"}
+        elif cmd == "cleanup_alsa":
+            await self.cleanup_alsa_devices()
+            return {"status": "alsa_cleanup_completed"}
         else:
             return {"error": f"Unknown command: {cmd}"}
 
