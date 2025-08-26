@@ -45,6 +45,20 @@ The following attributes are available for this model:
 3. **Audio Streaming**: Runs FFmpeg to stream the RTSP audio to the loopback device using ALSA
 4. **Status Monitoring**: Provides real-time status and FFmpeg output through sensor readings
 
+### Resilience Features
+
+The module includes automatic recovery mechanisms for common streaming issues:
+
+- **Connection Recovery**: Automatically detects and recovers from network connection errors
+- **Restart Management**: Limits restart attempts (max 3) with cooldown periods (10 seconds) to prevent rapid cycling
+- **FFmpeg Reconnection**: Uses FFmpeg's built-in reconnection options (`-reconnect`, `-reconnect_streamed`, `-reconnect_delay_max`)
+
+The module will automatically attempt to restart the stream when it detects:
+- Connection refused errors
+- Network timeouts
+- Broken pipe errors
+- End of file errors
+
 ### Sensor Readings
 
 The `get_readings()` method returns the following information:
@@ -54,8 +68,11 @@ The `get_readings()` method returns the following information:
 | `streaming_status`  | boolean | Whether the FFmpeg stream is currently active  |
 | `rtsp_url`          | string  | The configured RTSP URL                        |
 | `loopback_device`   | string  | The ALSA device number being used              |
+| `loopback_device_full` | string | The full ALSA device path (e.g., "hw:4,0,0") |
 | `ffmpeg_output`     | string  | The latest FFmpeg output line (includes stream info) |
 | `ffmpeg_process_id` | integer | The process ID of the running FFmpeg process   |
+| `last_activity_seconds` | float | Time since last FFmpeg activity (for monitoring) |
+| `restart_count`     | integer | Number of restart attempts made                |
 
 ### Example FFmpeg Output
 
@@ -82,6 +99,7 @@ This model implements DoCommand for controlling the audio stream:
 | `start_stream` | Start the FFmpeg audio stream  |
 | `stop_stream`  | Stop the FFmpeg audio stream   |
 | `restart_stream` | Restart the FFmpeg audio stream |
+| `reset_restart_count` | Reset the restart counter to allow more restart attempts |
 
 #### Example DoCommand
 
@@ -100,6 +118,12 @@ This model implements DoCommand for controlling the audio stream:
 ```json
 {
   "command": "restart_stream"
+}
+```
+
+```json
+{
+  "command": "reset_restart_count"
 }
 ```
 

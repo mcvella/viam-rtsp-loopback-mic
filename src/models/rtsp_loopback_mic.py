@@ -1,6 +1,7 @@
 import asyncio
 import subprocess
 import re
+import time
 from typing import (Any, ClassVar, Dict, Final, List, Mapping, Optional,
                     Sequence, Tuple)
 
@@ -27,6 +28,13 @@ class RtspLoopbackMic(Sensor, EasyResource):
     loopback_device: Optional[str] = None
     ffmpeg_output: str = ""
     is_streaming: bool = False
+    
+    # Simple resilience attributes
+    last_activity_time: float = 0.0
+    restart_count: int = 0
+    max_restarts: int = 3
+    restart_cooldown: float = 10.0  # seconds
+    last_restart_time: float = 0.0
 
     @classmethod
     def new(
@@ -159,13 +167,16 @@ class RtspLoopbackMic(Sensor, EasyResource):
             # Setup loopback device
             self.loopback_device = await self.setup_loopback_device()
             
-            # Build ffmpeg command
+            # Build ffmpeg command with basic resilience
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-i", self.rtsp_url,
                 "-f", "alsa",
                 f"hw:{self.loopback_device},0,0",
-                "-y"  # Overwrite output file if it exists
+                "-y",  # Overwrite output file if it exists
+                "-reconnect", "1",  # Enable reconnection
+                "-reconnect_streamed", "1",  # Reconnect for streamed content
+                "-reconnect_delay_max", "10"  # Max delay between reconnection attempts
             ]
             
             self.logger.info(f"Starting ffmpeg stream: {' '.join(ffmpeg_cmd)}")
@@ -179,6 +190,9 @@ class RtspLoopbackMic(Sensor, EasyResource):
             
             self.is_streaming = True
             self.ffmpeg_output = ""
+            self.last_activity_time = time.time()
+            self.restart_count += 1
+            self.last_restart_time = time.time()
             
             # Start monitoring the output
             asyncio.create_task(self.monitor_ffmpeg_output())
@@ -221,7 +235,15 @@ class RtspLoopbackMic(Sensor, EasyResource):
                 line_str = line.decode().strip()
                 if line_str:
                     self.ffmpeg_output = line_str
+                    self.last_activity_time = time.time()  # Update activity timestamp
                     self.logger.debug(f"FFmpeg output: {line_str}")
+                    
+                    # Check for error conditions that require restart
+                    if any(error_indicator in line_str.lower() for error_indicator in 
+                           ['connection refused', 'timeout', 'no route to host', 
+                            'connection reset', 'broken pipe', 'end of file']):
+                        self.logger.warning(f"FFmpeg error detected: {line_str}")
+                        await self.handle_stream_failure("connection_error")
         
         except Exception as e:
             self.logger.error(f"Error monitoring ffmpeg output: {e}")
@@ -229,6 +251,31 @@ class RtspLoopbackMic(Sensor, EasyResource):
             if self.ffmpeg_process:
                 await self.ffmpeg_process.wait()
                 self.is_streaming = False
+
+    async def handle_stream_failure(self, failure_type: str):
+        """Handle stream failures and attempt recovery."""
+        self.logger.warning(f"Stream failure detected: {failure_type}")
+        
+        # Check restart limits
+        current_time = time.time()
+        if (self.restart_count >= self.max_restarts and 
+            current_time - self.last_restart_time < self.restart_cooldown):
+            self.logger.warning(f"Too many restarts ({self.restart_count}), waiting for cooldown")
+            return
+        
+        # Reset restart count if enough time has passed
+        if current_time - self.last_restart_time > self.restart_cooldown:
+            self.restart_count = 0
+        
+        # Attempt restart if within limits
+        if self.restart_count < self.max_restarts:
+            self.logger.info(f"Attempting stream restart ({self.restart_count + 1}/{self.max_restarts})")
+            await self.stop_stream()
+            await asyncio.sleep(2)  # Brief delay before restart
+            await self.start_stream()
+        else:
+            self.logger.error(f"Max restart attempts reached ({self.max_restarts}), stopping recovery")
+            self.is_streaming = False
 
     async def get_readings(
         self,
@@ -247,12 +294,18 @@ class RtspLoopbackMic(Sensor, EasyResource):
             - ffmpeg_output: The latest ffmpeg output line
             - ffmpeg_process_id: The process ID if running
         """
+        current_time = time.time()
+        time_since_activity = current_time - self.last_activity_time if self.last_activity_time > 0 else 0
+        
         readings = {
             "streaming_status": self.is_streaming,
             "rtsp_url": self.rtsp_url or "Not configured",
             "loopback_device": self.loopback_device or "Not configured",
+            "loopback_device_full": f"hw:{self.loopback_device},0,0" if self.loopback_device else "Not configured",
             "ffmpeg_output": self.ffmpeg_output or "No output yet",
-            "ffmpeg_process_id": self.ffmpeg_process.pid if self.ffmpeg_process else None
+            "ffmpeg_process_id": self.ffmpeg_process.pid if self.ffmpeg_process else None,
+            "last_activity_seconds": round(time_since_activity, 1),
+            "restart_count": self.restart_count
         }
         
         return readings
@@ -283,6 +336,10 @@ class RtspLoopbackMic(Sensor, EasyResource):
             await self.stop_stream()
             await self.start_stream()
             return {"status": "restarted"}
+        elif cmd == "reset_restart_count":
+            self.restart_count = 0
+            self.last_restart_time = 0
+            return {"status": "restart_count_reset"}
         else:
             return {"error": f"Unknown command: {cmd}"}
 
